@@ -69,6 +69,10 @@ pub fn flash_loan(env: &Env, borrower: Address, amount: i128) -> Result<i128, Co
     if amount <= 0 {
         return Err(ContractError::VaultZeroAmount);
     }
+    // Apply minimum borrow threshold to prevent dust flash loan spam
+    if amount < crate::vaults::debt_share::MIN_BORROW_AMOUNT {
+        return Err(ContractError::AmountTooLow);
+    }
     let config = load_config(env)?;
     let token_client = token::Client::new(env, &config.asset);
     let initial_balance = token_client.balance(&env.current_contract_address());
@@ -662,5 +666,40 @@ mod tests {
             assert_eq!(crate::vaults::pause_guard::is_vault_paused(&env), true);
             assert_eq!(crate::vaults::pause_guard::is_emergency_withdrawal_active(&env), true);
         });
+    }
+
+    #[test]
+    fn flash_loan_rejects_below_minimum_threshold() {
+        let (env, _client, vault_admin, fee_recipient, asset) = setup();
+        let config = VaultConfig {
+            admin: vault_admin.clone(),
+            asset: asset.clone(),
+            fee_bps: DEFAULT_PERFORMANCE_FEE_BPS,
+            fee_recipient: fee_recipient.clone(),
+        };
+        env.storage().instance().set(&VaultStorageKey::Config, &config);
+        env.storage().instance().set(&VaultStorageKey::TotalAssets, &100_000i128);
+
+        let borrower = Address::generate(&env);
+        // Try to borrow below the minimum threshold (10,000 stroops)
+        let result = flash_loan(&env, borrower.clone(), 9_999);
+        assert_eq!(result, Err(ContractError::AmountTooLow));
+    }
+
+    #[test]
+    fn flash_loan_rejects_zero_amount() {
+        let (env, _client, vault_admin, fee_recipient, asset) = setup();
+        let config = VaultConfig {
+            admin: vault_admin.clone(),
+            asset: asset.clone(),
+            fee_bps: DEFAULT_PERFORMANCE_FEE_BPS,
+            fee_recipient: fee_recipient.clone(),
+        };
+        env.storage().instance().set(&VaultStorageKey::Config, &config);
+        env.storage().instance().set(&VaultStorageKey::TotalAssets, &100_000i128);
+
+        let borrower = Address::generate(&env);
+        let result = flash_loan(&env, borrower.clone(), 0);
+        assert_eq!(result, Err(ContractError::VaultZeroAmount));
     }
 }

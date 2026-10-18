@@ -39,6 +39,36 @@ pub const DEBT_SHARE_SCALE: u128 = 1_000_000_000_000_000_000;
 /// Basis-point denominator (10_000 bps == 100 %).
 const BPS_DENOMINATOR: u128 = 10_000;
 
+/// Minimum borrow amount (in stroops) accepted by vault borrow operations.
+///
+/// Borrow transactions carrying an amount below this threshold are rejected with
+/// [`ContractError::AmountTooLow`] to preserve ledger throughput and block
+/// spam attacks on the lending protocol.
+///
+/// Set to 10,000 stroops (0.001 XLM) — matches the minimum transfer threshold
+/// used across the protocol for anti-spam protection.
+pub const MIN_BORROW_AMOUNT: i128 = 10_000;
+
+/// Reject a borrow whose `amount` is below [`MIN_BORROW_AMOUNT`].
+///
+/// # Errors
+///
+/// Returns [`ContractError::AmountTooLow`] when `amount < MIN_BORROW_AMOUNT`.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// assert!(check_min_borrow(10_000).is_ok());
+/// assert_eq!(check_min_borrow(9_999), Err(ContractError::AmountTooLow));
+/// assert_eq!(check_min_borrow(0),     Err(ContractError::AmountTooLow));
+/// ```
+pub fn check_min_borrow(amount: i128) -> Result<(), ContractError> {
+    if amount < MIN_BORROW_AMOUNT {
+        return Err(ContractError::AmountTooLow);
+    }
+    Ok(())
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Global debt index state. `index_debt` starts at [`DEBT_SHARE_SCALE`] and
@@ -153,6 +183,7 @@ pub fn record_borrow(env: &Env, user: Address, amount: i128) -> Result<(), Contr
     if amount <= 0 {
         return Err(ContractError::VaultZeroAmount);
     }
+    check_min_borrow(amount)?;
 
     let mut state = get_index_state(env);
     let mut users = get_users(env);
@@ -320,12 +351,12 @@ mod tests {
     fn borrow_normalizes_into_share_and_tracks_total() {
         let (env, alice, bob) = env_with_two_borrowers();
 
-        record_borrow(&env, alice.clone(), 1_000).expect("alice borrow");
-        record_borrow(&env, bob.clone(), 3_000).expect("bob borrow");
+        record_borrow(&env, alice.clone(), 10_000).expect("alice borrow");
+        record_borrow(&env, bob.clone(), 30_000).expect("bob borrow");
 
-        assert_eq!(get_user_debt(&env, &alice), Ok(1_000));
-        assert_eq!(get_user_debt(&env, &bob), Ok(3_000));
-        assert_eq!(get_total_debt(&env), 4_000);
+        assert_eq!(get_user_debt(&env, &alice), Ok(10_000));
+        assert_eq!(get_user_debt(&env, &bob), Ok(30_000));
+        assert_eq!(get_total_debt(&env), 40_000);
         assert!(assert_debt_accounting_balances(&env).is_ok());
     }
 
@@ -333,11 +364,11 @@ mod tests {
     fn repayment_reduces_share_and_total() {
         let (env, alice, _) = env_with_two_borrowers();
 
-        record_borrow(&env, alice.clone(), 10_000).expect("borrow");
-        record_repayment(&env, alice.clone(), 4_000).expect("partial repay");
+        record_borrow(&env, alice.clone(), 100_000).expect("borrow");
+        record_repayment(&env, alice.clone(), 40_000).expect("partial repay");
 
-        assert_eq!(get_user_debt(&env, &alice), Ok(6_000));
-        assert_eq!(get_total_debt(&env), 6_000);
+        assert_eq!(get_user_debt(&env, &alice), Ok(60_000));
+        assert_eq!(get_total_debt(&env), 60_000);
         assert!(assert_debt_accounting_balances(&env).is_ok());
     }
 
@@ -345,8 +376,8 @@ mod tests {
     fn full_repayment_zeroes_share() {
         let (env, alice, _) = env_with_two_borrowers();
 
-        record_borrow(&env, alice.clone(), 7_000).expect("borrow");
-        record_repayment(&env, alice.clone(), 7_000).expect("full repay");
+        record_borrow(&env, alice.clone(), 70_000).expect("borrow");
+        record_repayment(&env, alice.clone(), 70_000).expect("full repay");
 
         assert_eq!(get_user_debt(&env, &alice), Ok(0));
         assert_eq!(get_total_debt(&env), 0);
@@ -355,9 +386,9 @@ mod tests {
     #[test]
     fn over_repayment_is_rejected() {
         let (env, alice, _) = env_with_two_borrowers();
-        record_borrow(&env, alice.clone(), 100).expect("borrow");
+        record_borrow(&env, alice.clone(), 10_000).expect("borrow");
         assert_eq!(
-            record_repayment(&env, alice.clone(), 101),
+            record_repayment(&env, alice.clone(), 10_001),
             Err(ContractError::VaultInsufficientBalance)
         );
     }
@@ -365,7 +396,7 @@ mod tests {
     #[test]
     fn accrual_grows_index_and_user_debt() {
         let (env, alice, _) = env_with_two_borrowers();
-        record_borrow(&env, alice.clone(), 1_000).expect("borrow");
+        record_borrow(&env, alice.clone(), 10_000).expect("borrow");
 
         // 1_000 bps (10 %/year) across 52_560 ledgers (~1 year at 1 ledger/min).
         accrue_interest_index(&env, 1_000, 52_560).expect("accrue");
@@ -375,14 +406,14 @@ mod tests {
         let index_after = get_debt_index(&env);
         accrue_interest_index(&env, 1_000, 52_560).expect("no-op accrue");
         assert_eq!(get_debt_index(&env), index_after);
-        assert_eq!(get_user_debt(&env, &alice), Ok(1_000));
+        assert_eq!(get_user_debt(&env, &alice), Ok(10_000));
     }
 
     #[test]
     fn accrual_applies_pro_rata_across_borrowers() {
         let (env, alice, bob) = env_with_two_borrowers();
-        record_borrow(&env, alice.clone(), 1_000).expect("alice");
-        record_borrow(&env, bob.clone(), 3_000).expect("bob");
+        record_borrow(&env, alice.clone(), 10_000).expect("alice");
+        record_borrow(&env, bob.clone(), 30_000).expect("bob");
 
         // Advance 1,000 ledgers so the accrual actually does something.
         let info = env.ledger().get();
@@ -404,7 +435,7 @@ mod tests {
     #[test]
     fn corrupted_total_is_caught_by_assertion() {
         let (env, alice, _) = env_with_two_borrowers();
-        record_borrow(&env, alice.clone(), 5_000).expect("borrow");
+        record_borrow(&env, alice.clone(), 50_000).expect("borrow");
 
         // Corrupt the tracked total out-of-band by 1 stroop.
         let mut state = get_index_state(&env);
@@ -415,5 +446,95 @@ mod tests {
             assert_debt_accounting_balances(&env),
             Err(ContractError::VaultDebtImbalance)
         );
+    }
+
+    // ── Minimum borrow threshold tests ─────────────────────────────────────
+
+    #[test]
+    fn rejects_zero_amount() {
+        let (env, alice, _) = env_with_two_borrowers();
+        assert_eq!(
+            record_borrow(&env, alice.clone(), 0),
+            Err(ContractError::VaultZeroAmount)
+        );
+    }
+
+    #[test]
+    fn rejects_negative_amount() {
+        let (env, alice, _) = env_with_two_borrowers();
+        assert_eq!(
+            record_borrow(&env, alice.clone(), -1),
+            Err(ContractError::VaultZeroAmount)
+        );
+    }
+
+    #[test]
+    fn rejects_one_stroop() {
+        let (env, alice, _) = env_with_two_borrowers();
+        assert_eq!(
+            record_borrow(&env, alice.clone(), 1),
+            Err(ContractError::AmountTooLow)
+        );
+    }
+
+    #[test]
+    fn rejects_one_below_threshold() {
+        let (env, alice, _) = env_with_two_borrowers();
+        assert_eq!(
+            record_borrow(&env, alice.clone(), MIN_BORROW_AMOUNT - 1),
+            Err(ContractError::AmountTooLow)
+        );
+    }
+
+    #[test]
+    fn rejects_typical_dust_amount_100_stroops() {
+        let (env, alice, _) = env_with_two_borrowers();
+        assert_eq!(
+            record_borrow(&env, alice.clone(), 100),
+            Err(ContractError::AmountTooLow)
+        );
+    }
+
+    #[test]
+    fn rejects_half_threshold() {
+        let (env, alice, _) = env_with_two_borrowers();
+        assert_eq!(
+            record_borrow(&env, alice.clone(), MIN_BORROW_AMOUNT / 2),
+            Err(ContractError::AmountTooLow)
+        );
+    }
+
+    #[test]
+    fn accepts_exactly_at_threshold() {
+        let (env, alice, _) = env_with_two_borrowers();
+        assert!(record_borrow(&env, alice.clone(), MIN_BORROW_AMOUNT).is_ok());
+    }
+
+    #[test]
+    fn accepts_one_above_threshold() {
+        let (env, alice, _) = env_with_two_borrowers();
+        assert!(record_borrow(&env, alice.clone(), MIN_BORROW_AMOUNT + 1).is_ok());
+    }
+
+    #[test]
+    fn accepts_typical_borrow_one_xlm() {
+        let (env, alice, _) = env_with_two_borrowers();
+        // 1 XLM = 10_000_000 stroops — well above threshold.
+        assert!(record_borrow(&env, alice.clone(), 10_000_000).is_ok());
+    }
+
+    #[test]
+    fn check_min_borrow_helper_rejects_below_threshold() {
+        assert_eq!(check_min_borrow(9_999), Err(ContractError::AmountTooLow));
+    }
+
+    #[test]
+    fn check_min_borrow_helper_accepts_at_threshold() {
+        assert!(check_min_borrow(MIN_BORROW_AMOUNT).is_ok());
+    }
+
+    #[test]
+    fn min_borrow_constant_matches_transfer_threshold() {
+        assert_eq!(MIN_BORROW_AMOUNT, 10_000);
     }
 }
